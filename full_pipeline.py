@@ -5,6 +5,7 @@
 # TODO: type hint for all code cells
 # TODO: markdown cells
 # TODO: sort imports
+# TODO: make some cells hidden by default
 
 # %%
 from typing import Dict, List, Tuple
@@ -18,11 +19,23 @@ from pandarallel import pandarallel
 pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=10)
 
 # %% [markdown]
-# Download our starter pack.
+# Download our starter pack
 
 # %%
 !wget #TODO: add link to data
 !unzip starterpack.zip
+
+# %% [markdown]
+# ## PART 1. Document retrieval
+
+# %% [markdown]
+# Prepare the environment and import all library we need
+
+# %%
+import hanlp
+import opencc
+import wikipedia
+wikipedia.set_lang("zh")
 
 # %% [markdown]
 # Preload the data.
@@ -32,18 +45,6 @@ from utils import load_json
 
 TRAIN_DATA = load_json("data/public_train.jsonl")
 TEST_DATA = load_json("data/public_test.jsonl")
-
-# %% [markdown]
-# ## 1. Document retrieval
-
-# %% [markdown]
-# Prepare the environment and import all library we need.
-
-# %%
-import hanlp
-import opencc
-import wikipedia
-wikipedia.set_lang("zh")
 
 # %% [markdown]
 # ### Helper function
@@ -76,7 +77,7 @@ def get_nps_hanlp(predictor, d) -> List:
 # 
 
 # %%
-def calculate_precision(data: list, predictions: pd.Series):
+def calculate_precision(data: List, predictions: pd.Series):
     precision = 0
     precision_hits = 0
 
@@ -95,7 +96,7 @@ def calculate_precision(data: list, predictions: pd.Series):
     print(f"Precision: {precision / precision_hits}")
 
 
-def calculate_recall(data: list, predictions: pd.Series):
+def calculate_recall(data: List, predictions: pd.Series):
     recall = 0
     recall_hits = 0
 
@@ -186,10 +187,10 @@ def get_pred_pages(x):
     return set(results)
 
 # %% [markdown]
-# ### Step 1. Get noun phrases from hanlp consituency parsing tree.
+# ### Step 1. Get noun phrases from hanlp consituency parsing tree
 
 # %% [markdown]
-# Setup hanlp predictor.
+# Setup [HanLP](https://github.com/hankcs/HanLP) predictor
 
 # %%
 predictor = (
@@ -206,7 +207,7 @@ predictor = (
 )
 
 # %% [markdown]
-# We will skip the process for creating parsing tree when demo on class.
+# We will skip the process for creating parsing tree when demo on class
 
 # %%
 predicted_results = f"data/retrieved_doc.pkl"
@@ -232,7 +233,7 @@ else:
 predicted_results.shape
 
 # %% [markdown]
-# ### Step 2. Calculate our results.
+# ### Step 2. Calculate our results
 
 # %%
 calculate_precision(TRAIN_DATA, predicted_results)
@@ -240,7 +241,7 @@ calculate_recall(TRAIN_DATA, predicted_results)
 save_aicup_data(TRAIN_DATA, predicted_results)
 
 # %% [markdown]
-# (Optional?) Step 3. Check on our test set.
+# ### (Optional?) Step 3. Check on our test set
 
 # %%
 hanlp_results = [get_nps_hanlp(predictor, d) for d in TEST_DATA]
@@ -252,12 +253,12 @@ predicted_results = test_df.parallel_apply(get_pred_pages, axis=1)
 save_aicup_data(TEST_DATA, predicted_results, mode="test")
 
 # %% [markdown]
-# ## 2. Sentence retrieval
+# ## PART 2. Sentence retrieval
+
+# %% [markdown]
+# Import some libs
 
 # %%
-# !pip install transformers
-# !pip install pandarallel
-
 from sklearn.model_selection import train_test_split
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -288,33 +289,249 @@ from utils import (
 )
 from dataset import BERTDataset
 
-# %%
-train_data = load_json("data/train_doc5.jsonl")
-label_map = {"supports": 0, "refutes": 1, "NOT ENOUGH INFO": 2}
+# %% [markdown]
+# Global variable
 
+# %%
 SEED = 42
 
-_y = [label_map[d["label"]] for d in train_data]
-train_gt, dev_gt = train_test_split(
-    train_data, test_size=0.2, random_state=SEED, shuffle=True, stratify=_y
+LABEL2ID: Dict[str, int] = {
+    "supports": 0,
+    "refutes": 1,
+    "NOT ENOUGH INFO": 2,
+}
+ID2LABEL: Dict[int, str] = {v: k for k, v in LABEL2ID.items()}
+
+DOC_DATA = load_json("data/train_doc5.jsonl")
+
+# GT means Ground Truth
+TRAIN_GT, DEV_GT = train_test_split(
+    DOC_DATA, test_size=0.2, random_state=SEED, shuffle=True, stratify=ID2LABEL
 )
 
-# %%
-# 下載 `wiki-pages.zip`
-# 此檔案與 Tbrain 網站上的資料是一樣的
-
-# !wget 140.116.245.105:33332/wiki-pages.zip
+# %% [markdown]
+# Preload wiki database
 
 # %%
-# 將 wiki-pages.zip 解壓縮至 data/ 底下
-# 指令：unzip `欲解壓縮檔案之位置` -d `解壓縮後的目的地`
-
-# !unzip "wiki-pages.zip" -d "data/"
 wiki_pages = jsonl_dir_to_df("data/wiki-pages")
 mapping = generate_evidence_to_wiki_pages_mapping(
     wiki_pages,
 )
 del wiki_pages
+
+# %% [markdown]
+# ### Helper function
+
+# %% [markdown]
+# 
+
+# %%
+def evidence_macro_precision(
+    instance: dict, top_rows: pd.DataFrame
+) -> Tuple[float, float]:
+    """Calculate precision for sentence retrieval
+    This function is modified from fever-scorer.
+    https://github.com/sheffieldnlp/fever-scorer/blob/master/src/fever/scorer.py
+
+    Args:
+        instance (dict): a row of the dev set (dev.jsonl) of test set (test.jsonl)
+        top_rows (pd.DataFrame): our predictions with the top probabilities
+
+        IMPORTANT!!!
+        instance (dict) should have the key of `evidence`.
+        top_rows (pd.DataFrame) should have a column `predicted_evidence`.
+
+    Returns:
+        Tuple[float, float]:
+        [1]: relevant and retrieved (numerator of precision)
+        [2]: retrieved (denominator of precision)
+    """
+    this_precision = 0.0
+    this_precision_hits = 0.0
+
+    if instance["label"].upper() != "NOT ENOUGH INFO":
+        all_evi = [
+            [e[2], e[3]] for eg in instance["evidence"] for e in eg if e[3] is not None
+        ]
+        claim = instance["claim"]
+        predicted_evidence = top_rows[top_rows["claim"] == claim][
+            "predicted_evidence"
+        ].tolist()
+
+        for prediction in predicted_evidence:
+            if prediction in all_evi:
+                this_precision += 1.0
+            this_precision_hits += 1.0
+
+        return (
+            this_precision / this_precision_hits
+        ) if this_precision_hits > 0 else 1.0, 1.0
+
+    return 0.0, 0.0
+
+# %% [markdown]
+# 
+
+# %%
+def evidence_macro_recall(
+    instance: dict, top_rows: pd.DataFrame
+) -> Tuple[float, float]:
+    """Calculate recall for sentence retrieval
+    This function is modified from fever-scorer.
+    https://github.com/sheffieldnlp/fever-scorer/blob/master/src/fever/scorer.py
+
+    Args:
+        instance (dict): a row of the dev set (dev.jsonl) of test set (test.jsonl)
+        top_rows (pd.DataFrame): our predictions with the top probabilities
+
+        IMPORTANT!!!
+        instance (dict) should have the key of `evidence`.
+        top_rows (pd.DataFrame) should have a column `predicted_evidence`.
+
+    Returns:
+        Tuple[float, float]:
+        [1]: relevant and retrieved (numerator of recall)
+        [2]: relevant (denominator of recall)
+    """
+    # We only want to score F1/Precision/Recall of recalled evidence for NEI claims
+    if instance["label"].upper() != "NOT ENOUGH INFO":
+        # If there's no evidence to predict, return 1
+        if len(instance["evidence"]) == 0 or all([len(eg) == 0 for eg in instance]):
+            return 1.0, 1.0
+
+        claim = instance["claim"]
+
+        predicted_evidence = top_rows[top_rows["claim"] == claim][
+            "predicted_evidence"
+        ].tolist()
+
+        for evidence_group in instance["evidence"]:
+            evidence = [[e[2], e[3]] for e in evidence_group]
+            if all([item in predicted_evidence for item in evidence]):
+                # We only want to score complete groups of evidence. Incomplete groups are worthless.
+                return 1.0, 1.0
+        return 0.0, 1.0
+    return 0.0, 0.0
+
+# %% [markdown]
+# 
+
+# %%
+def evaluate_retrieval(
+    probs: np.ndarray,
+    df_evidences: pd.DataFrame,
+    ground_truths: pd.DataFrame,
+    top_n: int = 5,
+    cal_scores: bool = True,
+    save_name: str = None,
+) -> Dict[str, float]:
+    """Calculate the scores of sentence retrieval
+
+    Args:
+        probs (np.ndarray): probabilities of the candidate retrieved sentences
+        df_evidences (pd.DataFrame): the candiate evidence sentences paired with claims
+        ground_truths (pd.DataFrame): the loaded data of dev.jsonl or test.jsonl
+        top_n (int, optional): the number of the retrieved sentences. Defaults to 2.
+
+    Returns:
+        dict[float, float, float]: F1 score, precision, and recall
+    """
+    df_evidences["prob"] = probs
+    top_rows = (
+        df_evidences.groupby("claim")
+        .apply(lambda x: x.nlargest(top_n, "prob"))
+        .reset_index(drop=True)
+    )
+    if cal_scores:
+        macro_precision = 0
+        macro_precision_hits = 0
+        macro_recall = 0
+        macro_recall_hits = 0
+
+        for i, instance in enumerate(ground_truths):
+            macro_prec = evidence_macro_precision(instance, top_rows)
+            macro_precision += macro_prec[0]
+            macro_precision_hits += macro_prec[1]
+
+            macro_rec = evidence_macro_recall(instance, top_rows)
+            macro_recall += macro_rec[0]
+            macro_recall_hits += macro_rec[1]
+
+        pr = (macro_precision / macro_precision_hits) if macro_precision_hits > 0 else 1.0
+        rec = (macro_recall / macro_recall_hits) if macro_recall_hits > 0 else 0.0
+        f1 = 2.0 * pr * rec / (pr + rec)
+
+    if save_name is not None:
+        # write doc7_sent5 file
+        with open(f"data/{save_name}", "w") as f:
+            for instance in ground_truths:
+                claim = instance["claim"]
+                predicted_evidence = top_rows[top_rows["claim"] == claim][
+                    "predicted_evidence"
+                ].tolist()
+                instance["predicted_evidence"] = predicted_evidence
+                f.write(json.dumps(instance, ensure_ascii=False) + "\n")
+
+    if cal_scores:
+        return {"F1 score": f1, "Precision": pr, "Recall": rec}
+
+# %% [markdown]
+# 
+
+# %%
+def get_predicted_probs(model, dataloader) -> np.ndarray:
+    """Inference script to get probabilites for the candidate evidence sentences
+
+    Args:
+        model: the one from HuggingFace Transformers
+        dataloader: devset or testset in torch dataloader
+
+    Returns:
+        np.ndarray: probabilites of the candidate evidence sentences
+    """
+    model.eval()
+    probs = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            logits = outputs.logits
+            probs.extend(torch.softmax(logits, dim=1)[:, 1].tolist())
+
+    return np.array(probs)
+
+# %% [markdown]
+# 
+
+# %%
+class SentRetrievalBERTDataset(BERTDataset):
+    """AicupTopkEvidenceBERTDataset class for AICUP dataset with top-k evidence sentences."""
+
+    def __getitem__(
+        self,
+        idx: int,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        item = self.data.iloc[idx]
+        sentA = item["claim"]
+        sentB = item["text"]
+
+        concat = self.tokenizer(
+            sentA,
+            sentB,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+        )
+        concat_ten = {k: torch.tensor(v) for k, v in concat.items()}
+        if "label" in item:
+            concat_ten["labels"] = torch.tensor(item["label"])
+
+        return concat_ten
+
+# %% [markdown]
+# ### Main function for sentence retrieval
 
 # %%
 def pair_with_wiki_sentences(
@@ -423,9 +640,13 @@ def pair_with_wiki_sentences_eval(
         "predicted_evidence": predicted_evidence,
     })
 
-# %%
-# Hyperparameters
+# %% [markdown]
+# ### Step 1. Setup training environment
 
+# %% [markdown]
+# Hyperparams
+
+# %%
 MODEL_NAME = "bert-base-chinese"
 NUM_EPOCHS = 1
 LR = 2e-5
@@ -435,240 +656,61 @@ NEGATIVE_RATIO = 0.03
 VALIDATION_STEP = 50
 TOP_N = 5
 
-exp_dir = (
-    f"sent_retrieval/0312_e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_"
-    + f"{LR}_neg{NEGATIVE_RATIO}_top{TOP_N}"
-)
-log_dir = "logs/" + exp_dir
-ckpt_dir = "checkpoints/" + exp_dir
-
-if not Path(log_dir).exists():
-    Path(log_dir).mkdir(parents=True)
-
-if not Path(ckpt_dir).exists():
-    Path(ckpt_dir).mkdir(parents=True)
+# %% [markdown]
+# Experiment Directory
 
 # %%
-train_df = pair_with_wiki_sentences(mapping, pd.DataFrame(train_gt), NEGATIVE_RATIO)
+EXP_DIR = (
+    f"sent_retrieval/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_"
+    + f"{LR}_neg{NEGATIVE_RATIO}_top{TOP_N}"
+)
+LOG_DIR = "logs/" + EXP_DIR
+CKPT_DIR = "checkpoints/" + EXP_DIR
+
+if not Path(LOG_DIR).exists():
+    Path(LOG_DIR).mkdir(parents=True)
+
+if not Path(CKPT_DIR).exists():
+    Path(CKPT_DIR).mkdir(parents=True)
+
+# %% [markdown]
+# ### Step 2. Combine claims and evidences
+
+# %%
+train_df = pair_with_wiki_sentences(mapping, pd.DataFrame(TRAIN_GT), NEGATIVE_RATIO)
 counts = train_df["label"].value_counts()
 print("Now using the following train data with 0 (Negative) and 1 (Positive)")
 print(counts)
 
-dev_evidences = pair_with_wiki_sentences_eval(mapping, pd.DataFrame(dev_gt))
+dev_evidences = pair_with_wiki_sentences_eval(mapping, pd.DataFrame(DEV_GT))
+
+# %% [markdown]
+# ### Step 3. Start training
+
+# %% [markdown]
+# Dataloader things
 
 # %%
-# Helper functions for evaluation
-
-def evidence_macro_precision(
-    instance: dict, top_rows: pd.DataFrame
-) -> Tuple[float, float]:
-    """Calculate precision for sentence retrieval
-    This function is modified from fever-scorer.
-    https://github.com/sheffieldnlp/fever-scorer/blob/master/src/fever/scorer.py
-
-    Args:
-        instance (dict): a row of the dev set (dev.jsonl) of test set (test.jsonl)
-        top_rows (pd.DataFrame): our predictions with the top probabilities
-
-        IMPORTANT!!!
-        instance (dict) should have the key of `evidence`.
-        top_rows (pd.DataFrame) should have a column `predicted_evidence`.
-
-    Returns:
-        Tuple[float, float]:
-        [1]: relevant and retrieved (numerator of precision)
-        [2]: retrieved (denominator of precision)
-    """
-    this_precision = 0.0
-    this_precision_hits = 0.0
-
-    if instance["label"].upper() != "NOT ENOUGH INFO":
-        all_evi = [
-            [e[2], e[3]] for eg in instance["evidence"] for e in eg if e[3] is not None
-        ]
-        claim = instance["claim"]
-        predicted_evidence = top_rows[top_rows["claim"] == claim][
-            "predicted_evidence"
-        ].tolist()
-
-        for prediction in predicted_evidence:
-            if prediction in all_evi:
-                this_precision += 1.0
-            this_precision_hits += 1.0
-
-        return (
-            this_precision / this_precision_hits
-        ) if this_precision_hits > 0 else 1.0, 1.0
-
-    return 0.0, 0.0
-
-
-def evidence_macro_recall(
-    instance: dict, top_rows: pd.DataFrame
-) -> Tuple[float, float]:
-    """Calculate recall for sentence retrieval
-    This function is modified from fever-scorer.
-    https://github.com/sheffieldnlp/fever-scorer/blob/master/src/fever/scorer.py
-
-    Args:
-        instance (dict): a row of the dev set (dev.jsonl) of test set (test.jsonl)
-        top_rows (pd.DataFrame): our predictions with the top probabilities
-
-        IMPORTANT!!!
-        instance (dict) should have the key of `evidence`.
-        top_rows (pd.DataFrame) should have a column `predicted_evidence`.
-
-    Returns:
-        Tuple[float, float]:
-        [1]: relevant and retrieved (numerator of recall)
-        [2]: relevant (denominator of recall)
-    """
-    # We only want to score F1/Precision/Recall of recalled evidence for NEI claims
-    if instance["label"].upper() != "NOT ENOUGH INFO":
-        # If there's no evidence to predict, return 1
-        if len(instance["evidence"]) == 0 or all([len(eg) == 0 for eg in instance]):
-            return 1.0, 1.0
-
-        claim = instance["claim"]
-
-        predicted_evidence = top_rows[top_rows["claim"] == claim][
-            "predicted_evidence"
-        ].tolist()
-
-        for evidence_group in instance["evidence"]:
-            evidence = [[e[2], e[3]] for e in evidence_group]
-            if all([item in predicted_evidence for item in evidence]):
-                # We only want to score complete groups of evidence. Incomplete groups are worthless.
-                return 1.0, 1.0
-        return 0.0, 1.0
-    return 0.0, 0.0
-
-
-def evaluate_retrieval(
-    probs: np.ndarray,
-    df_evidences: pd.DataFrame,
-    ground_truths: pd.DataFrame,
-    top_n: int = 5,
-    cal_scores: bool = True,
-    save_name: str = None,
-) -> dict[float, float, float]:
-    """Calculate the scores of sentence retrieval
-
-    Args:
-        probs (np.ndarray): probabilities of the candidate retrieved sentences
-        df_evidences (pd.DataFrame): the candiate evidence sentences paired with claims
-        ground_truths (pd.DataFrame): the loaded data of dev.jsonl or test.jsonl
-        top_n (int, optional): the number of the retrieved sentences. Defaults to 2.
-
-    Returns:
-        dict[float, float, float]: F1 score, precision, and recall
-    """
-    df_evidences["prob"] = probs
-    top_rows = (
-        df_evidences.groupby("claim")
-        .apply(lambda x: x.nlargest(top_n, "prob"))
-        .reset_index(drop=True)
-    )
-    if cal_scores:
-        macro_precision = 0
-        macro_precision_hits = 0
-        macro_recall = 0
-        macro_recall_hits = 0
-
-        for i, instance in enumerate(ground_truths):
-            macro_prec = evidence_macro_precision(instance, top_rows)
-            macro_precision += macro_prec[0]
-            macro_precision_hits += macro_prec[1]
-
-            macro_rec = evidence_macro_recall(instance, top_rows)
-            macro_recall += macro_rec[0]
-            macro_recall_hits += macro_rec[1]
-
-        pr = (macro_precision / macro_precision_hits) if macro_precision_hits > 0 else 1.0
-        rec = (macro_recall / macro_recall_hits) if macro_recall_hits > 0 else 0.0
-        f1 = 2.0 * pr * rec / (pr + rec)
-
-    if save_name is not None:
-        # write doc7_sent5 file
-        with open(f"data/{save_name}", "w") as f:
-            for instance in ground_truths:
-                claim = instance["claim"]
-                predicted_evidence = top_rows[top_rows["claim"] == claim][
-                    "predicted_evidence"
-                ].tolist()
-                instance["predicted_evidence"] = predicted_evidence
-                f.write(json.dumps(instance, ensure_ascii=False) + "\n")
-
-    if cal_scores:
-        return {"F1 score": f1, "Precision": pr, "Recall": rec}
-
-
-# %%
-def get_predicted_probs(model, dataloader) -> np.ndarray:
-    """Inference script to get probabilites for the candidate evidence sentences
-
-    Args:
-        model: the one from HuggingFace Transformers
-        dataloader: devset or testset in torch dataloader
-
-    Returns:
-        np.ndarray: probabilites of the candidate evidence sentences
-    """
-    model.eval()
-    probs = []
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            logits = outputs.logits
-            probs.extend(torch.softmax(logits, dim=1)[:, 1].tolist())
-
-    return np.array(probs)
-
-# %%
-class SentRetrievalBERTDataset(BERTDataset):
-    """AicupTopkEvidenceBERTDataset class for AICUP dataset with top-k evidence sentences."""
-
-    def __getitem__(
-        self,
-        idx: int,
-        **kwargs,
-    ) -> Tuple[Dict[str, torch.Tensor], int]:
-        item = self.data.iloc[idx]
-        sentA = item["claim"]
-        sentB = item["text"]
-
-        # concat_claim_evidence = " [SEP] ".join([sentA, sentB])
-
-        concat = self.tokenizer(
-            sentA,
-            sentB,
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-        )
-        concat_ten = {k: torch.tensor(v) for k, v in concat.items()}
-        if "label" in item:
-            concat_ten["labels"] = torch.tensor(item["label"])
-        return concat_ten
-
-# %%
-MODEL_NAME = "bert-base-chinese"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# Set up torch Datasets.
 train_dataset = SentRetrievalBERTDataset(train_df, tokenizer=tokenizer)
 val_dataset = SentRetrievalBERTDataset(dev_evidences, tokenizer=tokenizer)
 
-# Set up torch DataLoaders.
 train_dataloader = DataLoader(
     train_dataset, shuffle=True, batch_size=TRAIN_BATCH_SIZE
 )
 eval_dataloader = DataLoader(val_dataset, batch_size=TEST_BATCH_SIZE)
 
+# %% [markdown]
+# Save your memory.
+
 # %%
-# Set up our model.
+del train_df
+
+# %% [markdown]
+# Trainer
+
+# %%
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 model.to(device)
@@ -677,11 +719,9 @@ optimizer = AdamW(model.parameters(), lr=LR)
 num_training_steps = NUM_EPOCHS * len(train_dataloader)
 lr_scheduler = set_lr_scheduler(optimizer, num_training_steps)
 
-# Set up the TensorBoard writer
-writer = SummaryWriter(log_dir)
+writer = SummaryWriter(LOG_DIR)
 
 # %%
-# Get ready to training.
 progress_bar = tqdm(range(num_training_steps))
 current_steps = 0
 
@@ -714,25 +754,28 @@ for epoch in range(NUM_EPOCHS):
             val_results = evaluate_retrieval(
                 probs=probs,
                 df_evidences=dev_evidences,
-                ground_truths=dev_gt,
+                ground_truths=DEV_GT,
                 top_n=TOP_N,
             )
             print(val_results)
+
             # log each metric separately to TensorBoard
             for metric_name, metric_value in val_results.items():
                 writer.add_scalar(f"dev_{metric_name}", metric_value, current_steps)
 
-            save_checkpoint(model, ckpt_dir, current_steps)
+            save_checkpoint(model, CKPT_DIR, current_steps)
 
 print("Finished training!")
 
+# %% [markdown]
+# Validation part
+
 # %%
 ckpt_name = "model.50.pt"    # You need to change your best checkpoint.
-model = load_model(model, ckpt_name, ckpt_dir)
+model = load_model(model, ckpt_name, CKPT_DIR)
 print("Start final evaluations and write prediction files.")
 
-del train_df
-train_evidences = pair_with_wiki_sentences_eval(wiki_pages, pd.DataFrame(train_gt))
+train_evidences = pair_with_wiki_sentences_eval(wiki_pages, pd.DataFrame(TRAIN_GT))
 train_set = SentRetrievalBERTDataset(train_evidences, tokenizer)
 train_dataloader = DataLoader(train_set, batch_size=TEST_BATCH_SIZE)
 
@@ -741,7 +784,7 @@ probs = get_predicted_probs(model, train_dataloader)
 train_results = evaluate_retrieval(
     probs=probs,
     df_evidences=train_evidences,
-    ground_truths=train_gt,
+    ground_truths=TRAIN_GT,
     top_n=TOP_N,
     save_name=f"train_doc5sent{TOP_N}.jsonl",
 )
@@ -752,11 +795,14 @@ probs = get_predicted_probs(model, eval_dataloader)
 val_results = evaluate_retrieval(
     probs=probs,
     df_evidences=dev_evidences,
-    ground_truths=dev_gt,
+    ground_truths=DEV_GT,
     top_n=TOP_N,
     save_name=f"dev_doc5sent{TOP_N}.jsonl",
 )
 print(f"Validation scores => {val_results}")
+
+# %% [markdown]
+# ### (Optional?) Step 4. Check on our test data
 
 # %%
 test_data = load_json("data/test_doc5.jsonl")
@@ -777,12 +823,12 @@ evaluate_retrieval(
 )
 
 # %% [markdown]
-# # 3. Claim verification
+# ## PART 3. Claim verification
+
+# %% [markdown]
+# import libs
 
 # %%
-!pip install transformers
-!pip install pandarallel
-
 from typing import Dict, Tuple
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -814,39 +860,113 @@ from utils import (
 )
 from dataset import BERTDataset
 
+# %% [markdown]
+# Global variables
+
 # %%
-label2ID: Dict[str, int] = {
+SEED = 42
+
+LABEL2ID: Dict[str, int] = {
     "supports": 0,
     "refutes": 1,
     "NOT ENOUGH INFO": 2,
 }
-ID2label: Dict[int, str] = {v: k for k, v in label2ID.items()}
+ID2LABEL: Dict[int, str] = {v: k for k, v in LABEL2ID.items()}
+
+TRAIN_DATA = load_json("data/train_doc5sent5.jsonl")
+DEV_DATA = load_json("data/dev_doc5sent5.jsonl")
+
+TRAIN_PKL_FILE = Path("data/train_doc5sent5.pkl")
+DEV_PKL_FILE = Path("data/dev_doc5sent5.pkl")
+
+# %% [markdown]
+# Preload wiki database (same as part 2.)
 
 # %%
-# Hyperparameters
-
-TRAIN_BATCH_SIZE = 64
-TEST_BATCH_SIZE = 32
-LR = 7e-5
-NUM_EPOCHS = 20
-MAX_SEQ_LEN = 256
-EVIDENCE_TOPK = 5
-VALIDATION_STEP = 25
-
-OUTPUT_FILENAME = "submission.jsonl"
-
-exp_dir = (
-    f"claim_verification/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_"
-    + f"{LR}_top{EVIDENCE_TOPK}"
+wiki_pages = jsonl_dir_to_df("data/wiki-pages")
+mapping = generate_evidence_to_wiki_pages_mapping(
+    wiki_pages,
 )
-log_dir = "logs/" + exp_dir
-ckpt_dir = "checkpoints/" + exp_dir
+del wiki_pages
 
-if not Path(log_dir).exists():
-    Path(log_dir).mkdir(parents=True)
+# %% [markdown]
+# ### Helper function
 
-if not Path(ckpt_dir).exists():
-    Path(ckpt_dir).mkdir(parents=True)
+# %% [markdown]
+# 
+
+# %%
+class AicupTopkEvidenceBERTDataset(BERTDataset):
+    """AICUP dataset with top-k evidence sentences."""
+
+    def __getitem__(
+        self,
+        idx: int,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        item = self.data.iloc[idx]
+        claim = item["claim"]
+        evidence = item["evidence_list"]
+
+        # In case there are less than topk evidence sentences
+        pad = ["[PAD]"] * (self.topk - len(evidence))
+        evidence += pad
+        concat_claim_evidence = " [SEP] ".join([*claim, *evidence])
+
+        concat = self.tokenizer(
+            concat_claim_evidence,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+        )
+        label = LABEL2ID[item["label"]] if "label" in item else -1
+        concat_ten = {k: torch.tensor(v) for k, v in concat.items()}
+
+        if "label" in item:
+            concat_ten["labels"] = torch.tensor(label)
+        return concat_ten
+
+# %% [markdown]
+# 
+
+# %%
+def run_evaluation(model: torch.nn.Module, dataloader: DataLoader, device):
+    model.eval()
+
+    loss = 0
+    y_true = []
+    y_pred = []
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            y_true.extend(batch["labels"].tolist())
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss += outputs.loss.item()
+            logits = outputs.logits
+            y_pred.extend(torch.argmax(logits, dim=1).tolist())
+
+    acc = accuracy_score(y_true, y_pred)
+
+    return {"val_loss": loss / len(dataloader), "val_acc": acc}
+
+# %% [markdown]
+# 
+
+# %%
+def run_predict(model: torch.nn.Module, test_dl: DataLoader, device) -> list:
+    model.eval()
+
+    preds = []
+    for batch in tqdm(test_dl, total=len(test_dl), leave=False, desc="Predicting"):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        pred = model(**batch).logits
+        pred = torch.argmax(pred, dim=1)
+        preds.extend(pred.tolist())
+    return preds
+
+# %% [markdown]
+# ### Main function
 
 # %%
 def join_with_topk_evidence(
@@ -921,88 +1041,74 @@ def join_with_topk_evidence(
 
     return df
 
+# %% [markdown]
+# ### Step 1. Setup training environment
+
+# %% [markdown]
+# Hyperparams
+
 # %%
-# 下載 `wiki-pages.zip`
-# 此檔案與 Tbrain 網站上的資料是一樣的
+MODEL_NAME = "bert-base-chinese"
+TRAIN_BATCH_SIZE = 64
+TEST_BATCH_SIZE = 32
+LR = 7e-5
+NUM_EPOCHS = 20
+MAX_SEQ_LEN = 256
+EVIDENCE_TOPK = 5
+VALIDATION_STEP = 25
 
-!wget 140.116.245.105:33332/wiki-pages.zip
+# %% [markdown]
+# Experiment Directory
 
 # %%
-# 將 wiki-pages.zip 解壓縮至 data/ 底下
-# 指令：unzip `欲解壓縮檔案之位置` -d `解壓縮後的目的地`
+OUTPUT_FILENAME = "submission.jsonl"
 
-!unzip "wiki-pages.zip" -d "data/"
-wiki_pages = jsonl_dir_to_df("data/wiki-pages")
-mapping = generate_evidence_to_wiki_pages_mapping(
-    wiki_pages,
+EXP_DIR = (
+    f"claim_verification/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_"
+    + f"{LR}_top{EVIDENCE_TOPK}"
 )
-del wiki_pages
+LOG_DIR = "logs/" + EXP_DIR
+CKPT_DIR = "checkpoints/" + EXP_DIR
+
+if not Path(LOG_DIR).exists():
+    Path(LOG_DIR).mkdir(parents=True)
+
+if not Path(CKPT_DIR).exists():
+    Path(CKPT_DIR).mkdir(parents=True)
+
+# %% [markdown]
+# ### Step 2. Concat claim and evidences
 
 # %%
-train_data = load_json("data/train_doc5sent5.jsonl")
-dev_data = load_json("data/dev_doc5sent5.jsonl")
-
-train_pkl_file = Path("data/train_doc5sent5.pkl")
-if not train_pkl_file.exists():
+if not TRAIN_PKL_FILE.exists():
     train_df = join_with_topk_evidence(
-        pd.DataFrame(train_data),
+        pd.DataFrame(TRAIN_DATA),
         mapping,
         topk=EVIDENCE_TOPK,
     )
-    train_df.to_pickle(train_pkl_file, protocol=4)
+    train_df.to_pickle(TRAIN_PKL_FILE, protocol=4)
 else:
-    with open(train_pkl_file, "rb") as f:
+    with open(TRAIN_PKL_FILE, "rb") as f:
         train_df = pickle.load(f)
 
-dev_pkl_file = Path("data/dev_doc5sent5.pkl")
-if not dev_pkl_file.exists():
+if not DEV_PKL_FILE.exists():
     dev_df = join_with_topk_evidence(
-        pd.DataFrame(dev_data),
+        pd.DataFrame(DEV_DATA),
         mapping,
         mode="eval",
         topk=EVIDENCE_TOPK,
     )
-    dev_df.to_pickle(dev_pkl_file, protocol=4)
+    dev_df.to_pickle(DEV_PKL_FILE, protocol=4)
 else:
-    with open(dev_pkl_file, "rb") as f:
+    with open(DEV_PKL_FILE, "rb") as f:
         dev_df = pickle.load(f)
 
-# %%
-class AicupTopkEvidenceBERTDataset(BERTDataset):
-    """AICUP dataset with top-k evidence sentences."""
-
-    def __getitem__(
-        self,
-        idx: int,
-        **kwargs,
-    ) -> Tuple[Dict[str, torch.Tensor], int]:
-        item = self.data.iloc[idx]
-        claim = item["claim"]
-        evidence = item["evidence_list"]
-
-        # In case there are less than topk evidence sentences
-        pad = ["[PAD]"] * (self.topk - len(evidence))
-        evidence += pad
-        concat_claim_evidence = " [SEP] ".join([*claim, *evidence])
-
-        concat = self.tokenizer(
-            concat_claim_evidence,
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-        )
-        label = label2ID[item["label"]] if "label" in item else -1
-        concat_ten = {k: torch.tensor(v) for k, v in concat.items()}
-
-        if "label" in item:
-            concat_ten["labels"] = torch.tensor(label)
-        return concat_ten
+# %% [markdown]
+# ### Step 3. Training
 
 # %%
-MODEL_NAME = "bert-base-chinese"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# Set up torch Datasets.
 train_dataset = AicupTopkEvidenceBERTDataset(
     train_df,
     tokenizer=tokenizer,
@@ -1014,7 +1120,6 @@ val_dataset = AicupTopkEvidenceBERTDataset(
     max_length=MAX_SEQ_LEN,
 )
 
-# Set up torch DataLoaders.
 train_dataloader = DataLoader(
     train_dataset,
     shuffle=True,
@@ -1023,11 +1128,10 @@ train_dataloader = DataLoader(
 eval_dataloader = DataLoader(val_dataset, batch_size=TEST_BATCH_SIZE)
 
 # %%
-# Set up our model.
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model = AutoModelForSequenceClassification.from_pretrained(
     MODEL_NAME,
-    num_labels=len(label2ID),
+    num_labels=len(LABEL2ID),
 )
 model.to(device)
 
@@ -1035,32 +1139,9 @@ optimizer = AdamW(model.parameters(), lr=LR)
 num_training_steps = NUM_EPOCHS * len(train_dataloader)
 lr_scheduler = set_lr_scheduler(optimizer, num_training_steps)
 
-# Set up the TensorBoard writer
-writer = SummaryWriter(log_dir)
+writer = SummaryWriter(LOG_DIR)
 
 # %%
-def run_evaluation(model: torch.nn.Module, dataloader: DataLoader, device):
-    model.eval()
-
-    loss = 0
-    y_true = []
-    y_pred = []
-    with torch.no_grad():
-        for batch in tqdm(dataloader):
-            y_true.extend(batch["labels"].tolist())
-
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss += outputs.loss.item()
-            logits = outputs.logits
-            y_pred.extend(torch.argmax(logits, dim=1).tolist())
-
-    acc = accuracy_score(y_true, y_pred)
-
-    return {"val_loss": loss / len(dataloader), "val_acc": acc}
-
-# %%
-# Get ready to training.
 progress_bar = tqdm(range(num_training_steps))
 current_steps = 0
 
@@ -1097,36 +1178,28 @@ for epoch in range(NUM_EPOCHS):
 
             save_checkpoint(
                 model,
-                ckpt_dir,
+                CKPT_DIR,
                 current_steps,
                 mark=f"val_acc={val_results['val_acc']:.4f}",
             )
 
 print("Finished training!")
 
-# %%
-def run_predict(model: torch.nn.Module, test_dl: DataLoader, device) -> list:
-    model.eval()
-
-    preds = []
-    for batch in tqdm(test_dl, total=len(test_dl), leave=False, desc="Predicting"):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        pred = model(**batch).logits
-        pred = torch.argmax(pred, dim=1)
-        preds.extend(pred.tolist())
-    return preds
+# %% [markdown]
+# ### (Optional?) Step 4. Make your submission
 
 # %%
-test_data = load_json("data/test_doc5sent5.jsonl")
-test_pkl_file = Path("data/test_doc5sent5.pkl")
-if not test_pkl_file.exists():
+TEST_DATA = load_json("data/test_doc5sent5.jsonl")
+TEST_PKL_FILE = Path("data/test_doc5sent5.pkl")
+
+if not TEST_PKL_FILE.exists():
     test_df = join_with_topk_evidence(
-        pd.DataFrame(test_data),
+        pd.DataFrame(TEST_DATA),
         mapping,
         mode="eval",
         topk=EVIDENCE_TOPK,
     )
-    test_df.to_pickle(test_pkl_file, protocol=4)
+    test_df.to_pickle(TEST_PKL_FILE, protocol=4)
 else:
     with open(test_pkl_file, "rb") as f:
         test_df = pickle.load(f)
@@ -1138,16 +1211,19 @@ test_dataset = AicupTopkEvidenceBERTDataset(
 )
 test_dataloader = DataLoader(test_dataset, batch_size=TEST_BATCH_SIZE)
 
-# %%
-# Start prediction
+# %% [markdown]
+# Prediction
 
-ckpt_name = "val_acc=0.4208_model.75.pt"    # You need to change your best checkpoint.
-model = load_model(model, ckpt_name, ckpt_dir)
+# %%
+# TODO: change to your best checkpoint
+ckpt_name = "val_acc=0.4208_model.75.pt"
+model = load_model(model, ckpt_name, CKPT_DIR)
 predicted_label = run_predict(model, test_dataloader, device)
 
-# %%
-# Write prediction file
+# %% [markdown]
+# Write files
 
+# %%
 predict_dataset = test_df.copy()
 predict_dataset["predicted_label"] = list(map(ID2label.get, predicted_label))
 predict_dataset[["id", "predicted_label", "predicted_evidence"]].to_json(
