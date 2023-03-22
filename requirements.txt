@@ -6,3 +6,6 @@ torch==1.13.1
 tensorboard==2.12.0
 transformers==4.27.1
 scikit-learn==1.2.2
+opencc
+hanlp
+wikipedia
