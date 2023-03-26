@@ -28,7 +28,7 @@ def load_json(file_path: Union[Path, str]) -> pd.DataFrame:
 
         [946 rows x 10 columns]
     """
-    with open(file_path, "r") as json_file:
+    with open(file_path, "r", encoding="utf8") as json_file:
         json_list = list(json_file)
 
     return [json.loads(json_str) for json_str in json_list]
