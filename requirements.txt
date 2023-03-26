@@ -1,11 +1,13 @@
-black==23.1.0
-tqdm==4.65.0
-pandas==1.5.3
+--find-links https://download.pytorch.org/whl/torch_stable.html
+
+ipywidgets==8.0.5
 pandarallel==1.6.4
-torch==1.13.1
-tensorboard==2.12.0
-transformers==4.27.1
+pandas==1.5.3
 scikit-learn==1.2.2
+tensorboard==2.12.0
+torch==1.13.1+cu117
+tqdm==4.65.0
 opencc
 hanlp
-wikipedia
+transformers==4.27.1
+wikipedia==1.4.0
