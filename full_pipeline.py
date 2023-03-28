@@ -1,129 +1,185 @@
 # %% [markdown]
 # # Baseline
-
-# %%
-# TODO: type hint for all code cells
-# TODO: markdown cells
-# TODO: sort imports
-# TODO: make some cells hidden by default
-
-# %%
-from typing import Dict, List, Tuple
-from pathlib import Path
-import json
-import pickle
-import re
-import pandas as pd
-
-from pandarallel import pandarallel
-pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=10)
+# python: 3.8.*
 
 # %% [markdown]
-# Download our starter pack
+# Download our starter pack (3~5 min)
 
 # %%
-!wget #TODO: add link to data
-!unzip starterpack.zip
+!gdown --folder 1T6jpOtdf_i6XNYA6F_lqU4mRRh1xYPcl
+!mv baseline/* ./
+
+# %%
+%pip install -r requirements.txt
 
 # %% [markdown]
+# notebook1
 # ## PART 1. Document retrieval
 
 # %% [markdown]
 # Prepare the environment and import all library we need
 
 # %%
+# built-in libs
+import json
+import pickle
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Union
+
+# 3rd party libs
 import hanlp
 import opencc
+import pandas as pd
 import wikipedia
+from hanlp.components.pipeline import Pipeline
+from pandarallel import pandarallel
+
+# our own libs
+from utils import load_json
+
+pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=10)
 wikipedia.set_lang("zh")
 
 # %% [markdown]
 # Preload the data.
 
 # %%
-from utils import load_json
-
 TRAIN_DATA = load_json("data/public_train.jsonl")
 TEST_DATA = load_json("data/public_test.jsonl")
+CONVERTER_T2S = opencc.OpenCC("t2s.json")
+CONVERTER_S2T = opencc.OpenCC("s2t.json")
+
+# %% [markdown]
+# Data class for type hinting
+
+# %%
+@dataclass
+class Claim:
+    data: str
+
+@dataclass
+class AnnotationID:
+    id: int
+
+@dataclass
+class EvidenceID:
+    id: int
+
+@dataclass
+class PageTitle:
+    title: str
+
+@dataclass
+class SentenceID:
+    id: int
+
+@dataclass
+class Evidence:
+    data: List[List[Tuple[AnnotationID, EvidenceID, PageTitle, SentenceID]]]
 
 # %% [markdown]
 # ### Helper function
 
 # %% [markdown]
-# 
+# For the sake of consistency, we convert traditional to simplified Chinese first before converting it back to traditional Chinese.  This is due to some errors occuring when converting traditional to traditional Chinese.
 
 # %%
-def do_st_corrections(text):
-    converter_t2s = opencc.OpenCC("t2s.json")
-    converter_s2t = opencc.OpenCC("s2t.json")
-    simplified = converter_t2s.convert(text)
+def do_st_corrections(text: str) -> str:
+    simplified = CONVERTER_T2S.convert(text)
 
-    return converter_s2t.convert(simplified)
+    return CONVERTER_S2T.convert(simplified)
 
 # %% [markdown]
-# 
+# We use constituency parsing to separate part of speeches or so called constituent to extract noun phrases.  In the later stages, we will use the noun phrases as the query to search for relevant documents.  
 
 # %%
-def get_nps_hanlp(predictor, d) -> List:
+def get_nps_hanlp(
+    predictor: Pipeline,
+    d: Dict[str, Union[int, Claim, Evidence]],
+) -> List[str]:
     claim = d["claim"]
     tree = predictor(claim)["con"]
     nps = [
         do_st_corrections("".join(subtree.leaves()))
         for subtree in tree.subtrees(lambda t: t.label() == "NP")
     ]
+
     return nps
 
 # %% [markdown]
-# 
+# Precision refers to how many related documents are retrieved.  Recall refers to how many relevant documents are retrieved.  
 
 # %%
-def calculate_precision(data: List, predictions: pd.Series):
+def calculate_precision(
+    data: List[Dict[str, Union[int, Claim, Evidence]]],
+    predictions: pd.Series,
+) -> None:
     precision = 0
-    precision_hits = 0
+    count = 0
 
     for i, d in enumerate(data):
         if d["label"] == "NOT ENOUGH INFO":
             continue
-        gt_pages = set(
-            [evidence[2] for evidence_set in d["evidence"] for evidence in evidence_set]
-        )
+
+        # Extract all ground truth of titles of the wikipedia pages
+        # evidence[2] refers to the title of the wikipedia page
+        gt_pages = set([
+            evidence[2]
+            for evidence_set in d["evidence"]
+            for evidence in evidence_set
+        ])
+
         predicted_pages = predictions.iloc[i]
-        tmp_precision = predicted_pages.intersection(gt_pages)
+        hits = predicted_pages.intersection(gt_pages)
         if len(predicted_pages) != 0:
-            precision += len(tmp_precision) / len(predicted_pages)
-        precision_hits += 1
-        
-    print(f"Precision: {precision / precision_hits}")
+            precision += len(hits) / len(predicted_pages)
+
+        count += 1
+
+    # Macro precision
+    print(f"Precision: {precision / count}")
 
 
-def calculate_recall(data: List, predictions: pd.Series):
+def calculate_recall(
+    data: List[Dict[str, Union[int, Claim, Evidence]]],
+    predictions: pd.Series,
+) -> None:
     recall = 0
-    recall_hits = 0
+    count = 0
 
     for i, d in enumerate(data):
         if d["label"] == "NOT ENOUGH INFO":
             continue
-        gt_pages = set(
-            [evidence[2] for evidence_set in d["evidence"] for evidence in evidence_set]
-        )
-        predicted_pages = predictions.iloc[i]
-        tmp_recall = predicted_pages.intersection(gt_pages)
-        recall += len(tmp_recall) / len(gt_pages)
-        recall_hits += 1
 
-    print(f"Recall: {recall / recall_hits}")
+        gt_pages = set([
+            evidence[2]
+            for evidence_set in d["evidence"]
+            for evidence in evidence_set
+        ])
+        predicted_pages = predictions.iloc[i]
+        hits = predicted_pages.intersection(gt_pages)
+        recall += len(hits) / len(gt_pages)
+        count += 1
+
+    print(f"Recall: {recall / count}")
 
 # %% [markdown]
-# 
+# The default amount of documents retrieved is at most five documents.  This `num_pred_doc` can be adjusted based on your objective.  Save data in jsonl format.
 
 # %%
-def save_aicup_data(
-    data: list,
+def save_doc(
+    data: List[Dict[str, Union[int, Claim, Evidence]]],
     predictions: pd.Series,
     mode: str = "train",
     num_pred_doc: int = 5,
-):
-    with open(f"data/{mode}_doc{num_pred_doc}.jsonl", "w") as f:
+) -> None:
+    with open(
+        f"data/{mode}_doc{num_pred_doc}.jsonl",
+        "w",
+        encoding="utf8",
+    ) as f:
         for i, d in enumerate(data):
             d["predicted_pages"] = list(predictions.iloc[i])
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
@@ -132,40 +188,57 @@ def save_aicup_data(
 # ### Main function for document retrieval
 
 # %%
-def get_pred_pages(x):
+def get_pred_pages(series_data: pd.Series) -> Set[Dict[int, str]]:
     results = []
     tmp_muji = []
-    mapping = {}  # wiki_page: its index showned in claim
-    claim = x["claim"]
-    nps = x["hanlp_results"]
+    # wiki_page: its index showned in claim
+    mapping = {}
+    claim = series_data["claim"]
+    nps = series_data["hanlp_results"]
     first_wiki_term = []
 
     for i, np in enumerate(nps):
-        wiki_search_results = [do_st_corrections(w) for w in wikipedia.search(np)]
+        # Simplified Traditional Chinese Correction
+        wiki_search_results = [
+            do_st_corrections(w) for w in wikipedia.search(np)
+        ]
+
+        # Remove the wiki page's description in brackets
         wiki_set = [re.sub(r"\s\(\S+\)", "", w) for w in wiki_search_results]
-        wiki_df = pd.DataFrame(
-            {"wiki_set": wiki_set, "wiki_results": wiki_search_results}
-        )
+        wiki_df = pd.DataFrame({
+            "wiki_set": wiki_set,
+            "wiki_results": wiki_search_results
+        })
+
+        # Elements in wiki_set --> index
+        # Extracting only the first element is one way to avoid extracting
+        # too many of the similar wiki pages
         grouped_df = wiki_df.groupby("wiki_set", sort=False).first()
         candidates = grouped_df["wiki_results"].tolist()
+        # muji refers to wiki_set
         muji = grouped_df.index.tolist()
 
         for prefix, term in zip(muji, candidates):
             if prefix not in tmp_muji:
                 matched = False
+
+                # Take at least one term from the first noun phrase
                 if i == 0:
                     first_wiki_term.append(term)
-                if (
-                    ((new_term := term) in claim)
-                    or ((new_term := term.replace("·", "")) in claim)
-                    or ((new_term := term.split(" ")[0]) in claim)
-                    or ((new_term := term.replace("-", " ")) in claim) # TODO
-                ):
+
+                # Walrus operator :=
+                # https://docs.python.org/3/whatsnew/3.8.html#assignment-expressions
+                # Through these filters, we are trying to figure out if the term
+                # is within the claim
+                if (((new_term := term) in claim) or
+                    ((new_term := term.replace("·", "")) in claim) or
+                    ((new_term := term.split(" ")[0]) in claim) or
+                    ((new_term := term.replace("-", " ")) in claim)):
                     matched = True
 
                 elif "·" in term:
-                    splited = term.split("·")
-                    for split in splited:
+                    splitted = term.split("·")
+                    for split in splitted:
                         if (new_term := split) in claim:
                             matched = True
                             break
@@ -178,6 +251,7 @@ def get_pred_pages(x):
                     mapping[term] = claim.find(new_term)
                     tmp_muji.append(new_term)
 
+    # 5 is a hyperparameter
     if len(results) > 5:
         assert -1 not in mapping.values()
         results = sorted(mapping, key=mapping.get)[:5]
@@ -193,44 +267,44 @@ def get_pred_pages(x):
 # Setup [HanLP](https://github.com/hankcs/HanLP) predictor
 
 # %%
-predictor = (
-    hanlp.pipeline()
-    .append(
-        hanlp.load("FINE_ELECTRA_SMALL_ZH"),
-        output_key="tok",
-    )
-    .append(
-        hanlp.load("CTB9_CON_ELECTRA_SMALL"),
-        output_key="con",
-        input_key="tok",
-    )
-)
+predictor = (hanlp.pipeline().append(
+    hanlp.load("FINE_ELECTRA_SMALL_ZH"),
+    output_key="tok",
+).append(
+    hanlp.load("CTB9_CON_ELECTRA_SMALL"),
+    output_key="con",
+    input_key="tok",
+))
 
 # %% [markdown]
-# We will skip the process for creating parsing tree when demo on class
+# We will skip this process which for creating parsing tree when demo on class
 
 # %%
-predicted_results = f"data/retrieved_doc.pkl"
-
-if Path(predicted_results).exists():
-
-    with open(predicted_results, "rb") as f:
+hanlp_file = f"data/hanlp_con_results.pkl"
+if Path(hanlp_file).exists():
+    with open(hanlp_file, "rb") as f:
         hanlp_results = pickle.load(f)
-
 else:
-
-    hanlp_file = f"data/hanlp_con_results.pkl"
     hanlp_results = [get_nps_hanlp(predictor, d) for d in TRAIN_DATA]
-
     with open(hanlp_file, "wb") as f:
         pickle.dump(hanlp_results, f)
 
-    train_df = pd.DataFrame(TRAIN_DATA)
-    train_df.loc[:, "hanlp_results"] = hanlp_results
-    predicted_results = train_df.parallel_apply(get_pred_pages, axis=1)
+# %% [markdown]
+# Get pages via wiki online api
 
 # %%
-predicted_results.shape
+doc_path = f"data/train_doc5.jsonl"
+if Path(doc_path).exists():
+    with open(doc_path, "r", encoding="utf8") as f:
+        predicted_results = pd.Series([
+            set(json.loads(line)["predicted_pages"])
+            for line in f
+        ])
+else:
+    train_df = pd.DataFrame(TRAIN_DATA)
+    train_df.loc[:, "hanlp_results"] = hanlp_results
+    predicted_results = train_df.apply(get_pred_pages, axis=1)
+    save_doc(TRAIN_DATA, predicted_results, mode="train")
 
 # %% [markdown]
 # ### Step 2. Calculate our results
@@ -238,62 +312,89 @@ predicted_results.shape
 # %%
 calculate_precision(TRAIN_DATA, predicted_results)
 calculate_recall(TRAIN_DATA, predicted_results)
-save_aicup_data(TRAIN_DATA, predicted_results)
 
 # %% [markdown]
-# ### (Optional?) Step 3. Check on our test set
+# ### Step 3. Repeat the same process on test set
+# Create parsing tree
 
 # %%
-hanlp_results = [get_nps_hanlp(predictor, d) for d in TEST_DATA]
-
-test_df = pd.DataFrame(TEST_DATA)
-test_df.loc[:, "hanlp_results"] = hanlp_results
-
-predicted_results = test_df.parallel_apply(get_pred_pages, axis=1)
-save_aicup_data(TEST_DATA, predicted_results, mode="test")
+hanlp_test_file = f"data/hanlp_con_test_results.pkl"
+if Path(hanlp_test_file).exists():
+    with open(hanlp_file, "rb") as f:
+        hanlp_results = pickle.load(f)
+else:
+    hanlp_results = [get_nps_hanlp(predictor, d) for d in TEST_DATA]
+    with open(hanlp_file, "wb") as f:
+        pickle.dump(hanlp_results, f)
 
 # %% [markdown]
+# Get pages via wiki online api
+
+# %%
+test_doc_path = f"data/test_doc5.jsonl"
+if Path(test_doc_path).exists():
+    with open(test_doc_path, "r", encoding="utf8") as f:
+        test_results = pd.Series(
+            [set(json.loads(line)["predicted_pages"]) for line in f])
+else:
+    test_df = pd.DataFrame(TEST_DATA)
+    test_df.loc[:, "hanlp_results"] = hanlp_results
+    test_results = test_df.parallel_apply(get_pred_pages, axis=1)
+    save_doc(TEST_DATA, test_results, mode="test")
+
+# %% [markdown]
+# notebook2
 # ## PART 2. Sentence retrieval
 
 # %% [markdown]
 # Import some libs
 
 # %%
-from sklearn.model_selection import train_test_split
+# built-in libs
 from pathlib import Path
-from tqdm.auto import tqdm
+from typing import Dict, List, Set, Tuple, Union
+
+# third-party libs
 import numpy as np
 import pandas as pd
-
 from pandarallel import pandarallel
-pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=10)
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
 
 import torch
+import torch.nn as nn
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim import AdamW
-
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoTokenizer,
     get_scheduler,
 )
 
+from dataset import BERTDataset, Dataset
+
+# local libs
 from utils import (
-    load_json,
-    jsonl_dir_to_df,
     generate_evidence_to_wiki_pages_mapping,
-    set_lr_scheduler,
-    save_checkpoint,
+    jsonl_dir_to_df,
+    load_json,
     load_model,
+    save_checkpoint,
+    set_lr_scheduler,
 )
-from dataset import BERTDataset
+
+pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=10)
 
 # %% [markdown]
 # Global variable
 
 # %%
 SEED = 42
+
+TRAIN_DATA = load_json("data/public_train.jsonl")
+TEST_DATA = load_json("data/public_test.jsonl")
+DOC_DATA = load_json("data/train_doc5.jsonl")
 
 LABEL2ID: Dict[str, int] = {
     "supports": 0,
@@ -302,11 +403,14 @@ LABEL2ID: Dict[str, int] = {
 }
 ID2LABEL: Dict[int, str] = {v: k for k, v in LABEL2ID.items()}
 
-DOC_DATA = load_json("data/train_doc5.jsonl")
-
+_y = [LABEL2ID[data["label"]] for data in TRAIN_DATA]
 # GT means Ground Truth
 TRAIN_GT, DEV_GT = train_test_split(
-    DOC_DATA, test_size=0.2, random_state=SEED, shuffle=True, stratify=ID2LABEL
+    DOC_DATA,
+    test_size=0.2,
+    random_state=SEED,
+    shuffle=True,
+    stratify=_y,
 )
 
 # %% [markdown]
@@ -314,20 +418,19 @@ TRAIN_GT, DEV_GT = train_test_split(
 
 # %%
 wiki_pages = jsonl_dir_to_df("data/wiki-pages")
-mapping = generate_evidence_to_wiki_pages_mapping(
-    wiki_pages,
-)
+mapping = generate_evidence_to_wiki_pages_mapping(wiki_pages)
 del wiki_pages
 
 # %% [markdown]
 # ### Helper function
 
 # %% [markdown]
-# 
+# Calculate precision for sentence retrieval
 
 # %%
 def evidence_macro_precision(
-    instance: dict, top_rows: pd.DataFrame
+    instance: Dict,
+    top_rows: pd.DataFrame,
 ) -> Tuple[float, float]:
     """Calculate precision for sentence retrieval
     This function is modified from fever-scorer.
@@ -349,32 +452,35 @@ def evidence_macro_precision(
     this_precision = 0.0
     this_precision_hits = 0.0
 
+    # Return 0, 0 if label is not enough info since not enough info does not
+    # contain any evidence.
     if instance["label"].upper() != "NOT ENOUGH INFO":
-        all_evi = [
-            [e[2], e[3]] for eg in instance["evidence"] for e in eg if e[3] is not None
-        ]
+        # e[2] is the page title, e[3] is the sentence index
+        all_evi = [[e[2], e[3]]
+                   for eg in instance["evidence"]
+                   for e in eg
+                   if e[3] is not None]
         claim = instance["claim"]
-        predicted_evidence = top_rows[top_rows["claim"] == claim][
-            "predicted_evidence"
-        ].tolist()
+        predicted_evidence = top_rows[top_rows["claim"] ==
+                                      claim]["predicted_evidence"].tolist()
 
         for prediction in predicted_evidence:
             if prediction in all_evi:
                 this_precision += 1.0
             this_precision_hits += 1.0
 
-        return (
-            this_precision / this_precision_hits
-        ) if this_precision_hits > 0 else 1.0, 1.0
+        return (this_precision /
+                this_precision_hits) if this_precision_hits > 0 else 1.0, 1.0
 
     return 0.0, 0.0
 
 # %% [markdown]
-# 
+# Calculate recall for sentence retrieval
 
 # %%
 def evidence_macro_recall(
-    instance: dict, top_rows: pd.DataFrame
+    instance: Dict,
+    top_rows: pd.DataFrame,
 ) -> Tuple[float, float]:
     """Calculate recall for sentence retrieval
     This function is modified from fever-scorer.
@@ -396,25 +502,26 @@ def evidence_macro_recall(
     # We only want to score F1/Precision/Recall of recalled evidence for NEI claims
     if instance["label"].upper() != "NOT ENOUGH INFO":
         # If there's no evidence to predict, return 1
-        if len(instance["evidence"]) == 0 or all([len(eg) == 0 for eg in instance]):
+        if len(instance["evidence"]) == 0 or all(
+            [len(eg) == 0 for eg in instance]):
             return 1.0, 1.0
 
         claim = instance["claim"]
 
-        predicted_evidence = top_rows[top_rows["claim"] == claim][
-            "predicted_evidence"
-        ].tolist()
+        predicted_evidence = top_rows[top_rows["claim"] ==
+                                      claim]["predicted_evidence"].tolist()
 
         for evidence_group in instance["evidence"]:
             evidence = [[e[2], e[3]] for e in evidence_group]
             if all([item in predicted_evidence for item in evidence]):
-                # We only want to score complete groups of evidence. Incomplete groups are worthless.
+                # We only want to score complete groups of evidence. Incomplete
+                # groups are worthless.
                 return 1.0, 1.0
         return 0.0, 1.0
     return 0.0, 0.0
 
 # %% [markdown]
-# 
+# Calculate the scores of sentence retrieval
 
 # %%
 def evaluate_retrieval(
@@ -434,14 +541,15 @@ def evaluate_retrieval(
         top_n (int, optional): the number of the retrieved sentences. Defaults to 2.
 
     Returns:
-        dict[float, float, float]: F1 score, precision, and recall
+        Dict[str, float]: F1 score, precision, and recall
     """
     df_evidences["prob"] = probs
     top_rows = (
-        df_evidences.groupby("claim")
-        .apply(lambda x: x.nlargest(top_n, "prob"))
+        df_evidences.groupby("claim").apply(
+        lambda x: x.nlargest(top_n, "prob"))
         .reset_index(drop=True)
     )
+
     if cal_scores:
         macro_precision = 0
         macro_precision_hits = 0
@@ -457,8 +565,10 @@ def evaluate_retrieval(
             macro_recall += macro_rec[0]
             macro_recall_hits += macro_rec[1]
 
-        pr = (macro_precision / macro_precision_hits) if macro_precision_hits > 0 else 1.0
-        rec = (macro_recall / macro_recall_hits) if macro_recall_hits > 0 else 0.0
+        pr = (macro_precision /
+              macro_precision_hits) if macro_precision_hits > 0 else 1.0
+        rec = (macro_recall /
+               macro_recall_hits) if macro_recall_hits > 0 else 0.0
         f1 = 2.0 * pr * rec / (pr + rec)
 
     if save_name is not None:
@@ -466,9 +576,8 @@ def evaluate_retrieval(
         with open(f"data/{save_name}", "w") as f:
             for instance in ground_truths:
                 claim = instance["claim"]
-                predicted_evidence = top_rows[top_rows["claim"] == claim][
-                    "predicted_evidence"
-                ].tolist()
+                predicted_evidence = top_rows[
+                    top_rows["claim"] == claim]["predicted_evidence"].tolist()
                 instance["predicted_evidence"] = predicted_evidence
                 f.write(json.dumps(instance, ensure_ascii=False) + "\n")
 
@@ -476,10 +585,14 @@ def evaluate_retrieval(
         return {"F1 score": f1, "Precision": pr, "Recall": rec}
 
 # %% [markdown]
-# 
+# Inference script to get probabilites for the candidate evidence sentences
 
 # %%
-def get_predicted_probs(model, dataloader) -> np.ndarray:
+def get_predicted_probs(
+    model: nn.Module,
+    dataloader: Dataset,
+    device: torch.device,
+) -> np.ndarray:
     """Inference script to get probabilites for the candidate evidence sentences
 
     Args:
@@ -502,7 +615,7 @@ def get_predicted_probs(model, dataloader) -> np.ndarray:
     return np.array(probs)
 
 # %% [markdown]
-# 
+# AicupTopkEvidenceBERTDataset class for AICUP dataset with top-k evidence sentences
 
 # %%
 class SentRetrievalBERTDataset(BERTDataset):
@@ -517,6 +630,7 @@ class SentRetrievalBERTDataset(BERTDataset):
         sentA = item["claim"]
         sentB = item["text"]
 
+        # claim [SEP] text
         concat = self.tokenizer(
             sentA,
             sentB,
@@ -535,7 +649,7 @@ class SentRetrievalBERTDataset(BERTDataset):
 
 # %%
 def pair_with_wiki_sentences(
-    mapping: dict,
+    mapping: Dict[str, Dict[int, str]],
     df: pd.DataFrame,
     negative_ratio: float,
 ) -> pd.DataFrame:
@@ -548,14 +662,18 @@ def pair_with_wiki_sentences(
     for i in range(len(df)):
         if df["label"].iloc[i] == "NOT ENOUGH INFO":
             continue
+
         claim = df["claim"].iloc[i]
         evidence_sets = df["evidence"].iloc[i]
         for evidence_set in evidence_sets:
             sents = []
             for evidence in evidence_set:
+                # evidence[2] is the page title
                 page = evidence[2].replace(" ", "_")
+                # the only page with weird name
                 if page == "臺灣海峽危機#第二次臺灣海峽危機（1958）":
                     continue
+                # evidence[3] is in form of int however, mapping requires str
                 sent_idx = str(evidence[3])
                 sents.append(mapping[page][sent_idx])
 
@@ -577,9 +695,10 @@ def pair_with_wiki_sentences(
         predicted_pages = df["predicted_pages"][i]
         for page in predicted_pages:
             page = page.replace(" ", "_")
-            # ('城市規劃', sent_idx)
             try:
-                page_sent_id_pairs = [(page, sent_idx) for sent_idx in mapping[page].keys()]
+                page_sent_id_pairs = [
+                    (page, sent_idx) for sent_idx in mapping[page].keys()
+                ]
             except KeyError:
                 # print(f"{page} is not in our Wiki db.")
                 continue
@@ -598,7 +717,7 @@ def pair_with_wiki_sentences(
 
 
 def pair_with_wiki_sentences_eval(
-    mapping: dict,
+    mapping: Dict[str, Dict[int, str]],
     df: pd.DataFrame,
     is_testset: bool = False,
 ) -> pd.DataFrame:
@@ -617,21 +736,20 @@ def pair_with_wiki_sentences_eval(
         predicted_pages = df["predicted_pages"][i]
         for page in predicted_pages:
             page = page.replace(" ", "_")
-            # ('城市規劃', sent_idx)
             try:
                 page_sent_id_pairs = [(page, k) for k in mapping[page]]
             except KeyError:
                 # print(f"{page} is not in our Wiki db.")
                 continue
 
-            for pair in page_sent_id_pairs:
-                text = mapping[page][pair[1]]
+            for page_name, sentence_id in page_sent_id_pairs:
+                text = mapping[page][sentence_id]
                 if text != "":
                     claims.append(claim)
                     sentences.append(text)
                     if not is_testset:
                         evidence.append(df["evidence"].iloc[i])
-                    predicted_evidence.append([pair[0], int(pair[1])])
+                    predicted_evidence.append([page_name, int(sentence_id)])
 
     return pd.DataFrame({
         "claim": claims,
@@ -647,23 +765,22 @@ def pair_with_wiki_sentences_eval(
 # Hyperparams
 
 # %%
-MODEL_NAME = "bert-base-chinese"
-NUM_EPOCHS = 1
-LR = 2e-5
-TRAIN_BATCH_SIZE = 64
-TEST_BATCH_SIZE = 256
-NEGATIVE_RATIO = 0.03
-VALIDATION_STEP = 50
-TOP_N = 5
+#@title  { display-mode: "form" }
+
+MODEL_NAME = "bert-base-chinese"  #@param {type:"string"}
+NUM_EPOCHS = 1  #@param {type:"integer"}
+LR = 2e-5  #@param {type:"number"}
+TRAIN_BATCH_SIZE = 64  #@param {type:"integer"}
+TEST_BATCH_SIZE = 256  #@param {type:"integer"}
+NEGATIVE_RATIO = 0.03  #@param {type:"number"}
+VALIDATION_STEP = 50  #@param {type:"integer"}
+TOP_N = 5  #@param {type:"integer"}
 
 # %% [markdown]
 # Experiment Directory
 
 # %%
-EXP_DIR = (
-    f"sent_retrieval/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_"
-    + f"{LR}_neg{NEGATIVE_RATIO}_top{TOP_N}"
-)
+EXP_DIR = f"sent_retrieval/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_" + f"{LR}_neg{NEGATIVE_RATIO}_top{TOP_N}"
 LOG_DIR = "logs/" + EXP_DIR
 CKPT_DIR = "checkpoints/" + EXP_DIR
 
@@ -677,7 +794,11 @@ if not Path(CKPT_DIR).exists():
 # ### Step 2. Combine claims and evidences
 
 # %%
-train_df = pair_with_wiki_sentences(mapping, pd.DataFrame(TRAIN_GT), NEGATIVE_RATIO)
+train_df = pair_with_wiki_sentences(
+    mapping,
+    pd.DataFrame(TRAIN_GT),
+    NEGATIVE_RATIO,
+)
 counts = train_df["label"].value_counts()
 print("Now using the following train data with 0 (Negative) and 1 (Positive)")
 print(counts)
@@ -697,7 +818,9 @@ train_dataset = SentRetrievalBERTDataset(train_df, tokenizer=tokenizer)
 val_dataset = SentRetrievalBERTDataset(dev_evidences, tokenizer=tokenizer)
 
 train_dataloader = DataLoader(
-    train_dataset, shuffle=True, batch_size=TRAIN_BATCH_SIZE
+    train_dataset,
+    shuffle=True,
+    batch_size=TRAIN_BATCH_SIZE,
 )
 eval_dataloader = DataLoader(val_dataset, batch_size=TEST_BATCH_SIZE)
 
@@ -711,7 +834,8 @@ del train_df
 # Trainer
 
 # %%
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device(
+    "cpu")
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 model.to(device)
 
@@ -720,6 +844,9 @@ num_training_steps = NUM_EPOCHS * len(train_dataloader)
 lr_scheduler = set_lr_scheduler(optimizer, num_training_steps)
 
 writer = SummaryWriter(LOG_DIR)
+
+# %% [markdown]
+# Please make sure that you are using gpu when training
 
 # %%
 progress_bar = tqdm(range(num_training_steps))
@@ -741,15 +868,13 @@ for epoch in range(NUM_EPOCHS):
         writer.add_scalar("training_loss", loss.item(), current_steps)
 
         y_pred = torch.argmax(outputs.logits, dim=1).tolist()
-
         y_true = batch["labels"].tolist()
-        # print(f"batch train acc: {accuracy_score(y_true, y_pred)}")
 
         current_steps += 1
 
         if current_steps % VALIDATION_STEP == 0 and current_steps > 0:
             print("Start validation")
-            probs = get_predicted_probs(model, eval_dataloader)
+            probs = get_predicted_probs(model, eval_dataloader, device)
 
             val_results = evaluate_retrieval(
                 probs=probs,
@@ -761,26 +886,37 @@ for epoch in range(NUM_EPOCHS):
 
             # log each metric separately to TensorBoard
             for metric_name, metric_value in val_results.items():
-                writer.add_scalar(f"dev_{metric_name}", metric_value, current_steps)
+                writer.add_scalar(
+                    f"dev_{metric_name}",
+                    metric_value,
+                    current_steps,
+                )
 
             save_checkpoint(model, CKPT_DIR, current_steps)
 
 print("Finished training!")
 
+# %%
+%load_ext tensorboard
+%tensorboard --logdir logs
+
 # %% [markdown]
-# Validation part
+# Validation part (10 mins)
 
 # %%
-ckpt_name = "model.50.pt"    # You need to change your best checkpoint.
+ckpt_name = "model.50.pt"  #@param {type:"string"}
 model = load_model(model, ckpt_name, CKPT_DIR)
 print("Start final evaluations and write prediction files.")
 
-train_evidences = pair_with_wiki_sentences_eval(wiki_pages, pd.DataFrame(TRAIN_GT))
+train_evidences = pair_with_wiki_sentences_eval(
+    mapping=mapping,
+    df=pd.DataFrame(TRAIN_GT),
+)
 train_set = SentRetrievalBERTDataset(train_evidences, tokenizer)
 train_dataloader = DataLoader(train_set, batch_size=TEST_BATCH_SIZE)
 
 print("Start calculating training scores")
-probs = get_predicted_probs(model, train_dataloader)
+probs = get_predicted_probs(model, train_dataloader, device)
 train_results = evaluate_retrieval(
     probs=probs,
     df_evidences=train_evidences,
@@ -791,7 +927,7 @@ train_results = evaluate_retrieval(
 print(f"Training scores => {train_results}")
 
 print("Start validation")
-probs = get_predicted_probs(model, eval_dataloader)
+probs = get_predicted_probs(model, eval_dataloader, device)
 val_results = evaluate_retrieval(
     probs=probs,
     df_evidences=dev_evidences,
@@ -799,20 +935,25 @@ val_results = evaluate_retrieval(
     top_n=TOP_N,
     save_name=f"dev_doc5sent{TOP_N}.jsonl",
 )
+
 print(f"Validation scores => {val_results}")
 
 # %% [markdown]
-# ### (Optional?) Step 4. Check on our test data
+# ### Step 4. Check on our test data
 
 # %%
 test_data = load_json("data/test_doc5.jsonl")
 
-test_evidences = pair_with_wiki_sentences_eval(wiki_pages, pd.DataFrame(test_data), is_testset=True)
+test_evidences = pair_with_wiki_sentences_eval(
+    mapping,
+    pd.DataFrame(test_data),
+    is_testset=True,
+)
 test_set = SentRetrievalBERTDataset(test_evidences, tokenizer)
 test_dataloader = DataLoader(test_set, batch_size=TEST_BATCH_SIZE)
 
 print("Start predicting the test data")
-probs = get_predicted_probs(model, test_dataloader)
+probs = get_predicted_probs(model, test_dataloader, device)
 evaluate_retrieval(
     probs=probs,
     df_evidences=test_evidences,
@@ -823,49 +964,49 @@ evaluate_retrieval(
 )
 
 # %% [markdown]
+# notebook3
 # ## PART 3. Claim verification
 
 # %% [markdown]
 # import libs
 
 # %%
-from typing import Dict, Tuple
-from pathlib import Path
-from tqdm.auto import tqdm
 import pickle
+from pathlib import Path
+from typing import Dict, Tuple
+
 import numpy as np
 import pandas as pd
 from pandarallel import pandarallel
-
-pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=4)
+from tqdm.auto import tqdm
 
 import torch
+from sklearn.metrics import accuracy_score
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim import AdamW
-
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoTokenizer,
     get_scheduler,
 )
-from sklearn.metrics import accuracy_score
-from utils import (
-    load_json,
-    jsonl_dir_to_df,
-    generate_evidence_to_wiki_pages_mapping,
-    set_lr_scheduler,
-    save_checkpoint,
-    load_model,
-)
+
 from dataset import BERTDataset
+from utils import (
+    generate_evidence_to_wiki_pages_mapping,
+    jsonl_dir_to_df,
+    load_json,
+    load_model,
+    save_checkpoint,
+    set_lr_scheduler,
+)
+
+pandarallel.initialize(progress_bar=True, verbose=0, nb_workers=4)
 
 # %% [markdown]
 # Global variables
 
 # %%
-SEED = 42
-
 LABEL2ID: Dict[str, int] = {
     "supports": 0,
     "refutes": 1,
@@ -884,16 +1025,14 @@ DEV_PKL_FILE = Path("data/dev_doc5sent5.pkl")
 
 # %%
 wiki_pages = jsonl_dir_to_df("data/wiki-pages")
-mapping = generate_evidence_to_wiki_pages_mapping(
-    wiki_pages,
-)
+mapping = generate_evidence_to_wiki_pages_mapping(wiki_pages,)
 del wiki_pages
 
 # %% [markdown]
 # ### Helper function
 
 # %% [markdown]
-# 
+# AICUP dataset with top-k evidence sentences.
 
 # %%
 class AicupTopkEvidenceBERTDataset(BERTDataset):
@@ -924,10 +1063,11 @@ class AicupTopkEvidenceBERTDataset(BERTDataset):
 
         if "label" in item:
             concat_ten["labels"] = torch.tensor(label)
+
         return concat_ten
 
 # %% [markdown]
-# 
+# Evaluation function
 
 # %%
 def run_evaluation(model: torch.nn.Module, dataloader: DataLoader, device):
@@ -951,14 +1091,17 @@ def run_evaluation(model: torch.nn.Module, dataloader: DataLoader, device):
     return {"val_loss": loss / len(dataloader), "val_acc": acc}
 
 # %% [markdown]
-# 
+# Prediction
 
 # %%
 def run_predict(model: torch.nn.Module, test_dl: DataLoader, device) -> list:
     model.eval()
 
     preds = []
-    for batch in tqdm(test_dl, total=len(test_dl), leave=False, desc="Predicting"):
+    for batch in tqdm(test_dl,
+                      total=len(test_dl),
+                      leave=False,
+                      desc="Predicting"):
         batch = {k: v.to(device) for k, v in batch.items()}
         pred = model(**batch).logits
         pred = torch.argmax(pred, dim=1)
@@ -1002,42 +1145,26 @@ def join_with_topk_evidence(
     # format evidence column to List[List[Tuple[str, str, str, str]]]
     if "evidence" in df.columns:
         df["evidence"] = df["evidence"].parallel_map(
-            lambda x: [[x]]
-            if not isinstance(x[0], list)
-            else [x]
-            if not isinstance(x[0][0], list)
-            else x
-        )
+            lambda x: [[x]] if not isinstance(x[0], list) else [x]
+            if not isinstance(x[0][0], list) else x)
 
     print(f"Extracting evidence_list for the {mode} mode ...")
     if mode == "eval":
         # extract evidence
-        df["evidence_list"] = df["predicted_evidence"].parallel_map(
-            lambda x: [
-                mapping.get(evi_id, {}).get(str(evi_idx), "")
-                for evi_id, evi_idx in x  # for each evidence list
-            ][:topk]
-            if isinstance(x, list)
-            else []
-        )
+        df["evidence_list"] = df["predicted_evidence"].parallel_map(lambda x: [
+            mapping.get(evi_id, {}).get(str(evi_idx), "")
+            for evi_id, evi_idx in x  # for each evidence list
+        ][:topk] if isinstance(x, list) else [])
         print(df["evidence_list"][:5])
     else:
         # extract evidence
-        df["evidence_list"] = df["evidence"].parallel_map(
-            lambda x: [
-                " ".join(
-                    [  # join evidence
-                        mapping.get(evi_id, {}).get(str(evi_idx), "")
-                        for _, _, evi_id, evi_idx in evi_list
-                    ]
-                )
-                if isinstance(evi_list, list)
-                else ""
-                for evi_list in x  # for each evidence list
-            ][:1]
-            if isinstance(x, list)
-            else []
-        )
+        df["evidence_list"] = df["evidence"].parallel_map(lambda x: [
+            " ".join([  # join evidence
+                mapping.get(evi_id, {}).get(str(evi_idx), "")
+                for _, _, evi_id, evi_idx in evi_list
+            ]) if isinstance(evi_list, list) else ""
+            for evi_list in x  # for each evidence list
+        ][:1] if isinstance(x, list) else [])
 
     return df
 
@@ -1048,14 +1175,18 @@ def join_with_topk_evidence(
 # Hyperparams
 
 # %%
-MODEL_NAME = "bert-base-chinese"
-TRAIN_BATCH_SIZE = 64
-TEST_BATCH_SIZE = 32
-LR = 7e-5
-NUM_EPOCHS = 20
-MAX_SEQ_LEN = 256
-EVIDENCE_TOPK = 5
-VALIDATION_STEP = 25
+#@title  { display-mode: "form" }
+
+MODEL_NAME = "bert-base-chinese"  #@param {type:"string"}
+TRAIN_BATCH_SIZE = 32  #@param {type:"integer"}
+TEST_BATCH_SIZE = 32  #@param {type:"integer"}
+SEED = 42  #@param {type:"integer"}
+LR = 7e-5  #@param {type:"number"}
+NUM_EPOCHS = 20  #@param {type:"integer"}
+MAX_SEQ_LEN = 256  #@param {type:"integer"}
+EVIDENCE_TOPK = 5  #@param {type:"integer"}
+VALIDATION_STEP = 25  #@param {type:"integer"}
+
 
 # %% [markdown]
 # Experiment Directory
@@ -1063,10 +1194,7 @@ VALIDATION_STEP = 25
 # %%
 OUTPUT_FILENAME = "submission.jsonl"
 
-EXP_DIR = (
-    f"claim_verification/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_"
-    + f"{LR}_top{EVIDENCE_TOPK}"
-)
+EXP_DIR = f"claim_verification/e{NUM_EPOCHS}_bs{TRAIN_BATCH_SIZE}_" + f"{LR}_top{EVIDENCE_TOPK}"
 LOG_DIR = "logs/" + EXP_DIR
 CKPT_DIR = "checkpoints/" + EXP_DIR
 
@@ -1078,6 +1206,7 @@ if not Path(CKPT_DIR).exists():
 
 # %% [markdown]
 # ### Step 2. Concat claim and evidences
+# join topk evidence
 
 # %%
 if not TRAIN_PKL_FILE.exists():
@@ -1107,6 +1236,9 @@ else:
 # ### Step 3. Training
 
 # %%
+torch.cuda.empty_cache()
+
+# %%
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 train_dataset = AicupTopkEvidenceBERTDataset(
@@ -1128,7 +1260,8 @@ train_dataloader = DataLoader(
 eval_dataloader = DataLoader(val_dataset, batch_size=TEST_BATCH_SIZE)
 
 # %%
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device(
+    "cpu")
 model = AutoModelForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=len(LABEL2ID),
@@ -1140,6 +1273,9 @@ num_training_steps = NUM_EPOCHS * len(train_dataloader)
 lr_scheduler = set_lr_scheduler(optimizer, num_training_steps)
 
 writer = SummaryWriter(LOG_DIR)
+
+# %% [markdown]
+# Training (30 mins)
 
 # %%
 progress_bar = tqdm(range(num_training_steps))
@@ -1161,9 +1297,7 @@ for epoch in range(NUM_EPOCHS):
         writer.add_scalar("training_loss", loss.item(), current_steps)
 
         y_pred = torch.argmax(outputs.logits, dim=1).tolist()
-
         y_true = batch["labels"].tolist()
-        # print(f"batch train acc: {accuracy_score(y_true, y_pred)}")
 
         current_steps += 1
 
@@ -1186,7 +1320,7 @@ for epoch in range(NUM_EPOCHS):
 print("Finished training!")
 
 # %% [markdown]
-# ### (Optional?) Step 4. Make your submission
+# ### Step 4. Make your submission
 
 # %%
 TEST_DATA = load_json("data/test_doc5sent5.jsonl")
@@ -1201,7 +1335,7 @@ if not TEST_PKL_FILE.exists():
     )
     test_df.to_pickle(TEST_PKL_FILE, protocol=4)
 else:
-    with open(test_pkl_file, "rb") as f:
+    with open(TEST_PKL_FILE, "rb") as f:
         test_df = pickle.load(f)
 
 test_dataset = AicupTopkEvidenceBERTDataset(
@@ -1215,8 +1349,7 @@ test_dataloader = DataLoader(test_dataset, batch_size=TEST_BATCH_SIZE)
 # Prediction
 
 # %%
-# TODO: change to your best checkpoint
-ckpt_name = "val_acc=0.4208_model.75.pt"
+ckpt_name = "val_acc=0.4259_model.750.pt"  #@param {type:"string"}
 model = load_model(model, ckpt_name, CKPT_DIR)
 predicted_label = run_predict(model, test_dataloader, device)
 
@@ -1225,7 +1358,7 @@ predicted_label = run_predict(model, test_dataloader, device)
 
 # %%
 predict_dataset = test_df.copy()
-predict_dataset["predicted_label"] = list(map(ID2label.get, predicted_label))
+predict_dataset["predicted_label"] = list(map(ID2LABEL.get, predicted_label))
 predict_dataset[["id", "predicted_label", "predicted_evidence"]].to_json(
     OUTPUT_FILENAME,
     orient="records",
