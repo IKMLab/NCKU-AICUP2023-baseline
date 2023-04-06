@@ -13,5 +13,5 @@
 
 ## 📚 巡迴課程簡報
 我們分別在 3/29, 3/30 於台北科技大學和中央大學舉辦了巡迴課程，簡報內容如下：
-- [[Slides](https://drive.google.com/file/d/1Y3E851007TDRlj8-HPqkigaCwCZVS0l4/view?usp=share_link)] （北科場）
-- [[Slides](https://drive.google.com/file/d/1hViWx_sueee2ayhCj7xwyARs3Nu6efXH/view?usp=sharing)] （中央場）
+- [[Video](https://ncku365-my.sharepoint.com/:v:/g/personal/p78081057_ncku_edu_tw/ETrOh88ggj1OuKpDHmi7hKEBcOpOXgYYOg4yIVH9Chq_MQ?e=LwxcIA)] [[Slides](https://drive.google.com/file/d/1Y3E851007TDRlj8-HPqkigaCwCZVS0l4/view?usp=share_link)] （北科場）
+- [[Video](https://drive.google.com/file/d/1LvE7T4bjRjtkzidtklpWm38_fUSIJDuf/view?usp=share_link)] [[Slides](https://drive.google.com/file/d/1hViWx_sueee2ayhCj7xwyARs3Nu6efXH/view?usp=sharing)] （中央場）
